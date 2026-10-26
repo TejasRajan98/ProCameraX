@@ -48,8 +48,9 @@ import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.aspectRatio
@@ -67,6 +68,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -76,7 +78,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
@@ -98,6 +103,7 @@ import com.example.procamerax.ui.components.overlays.ShutterFlashOverlay
 import com.example.procamerax.ui.components.overlays.SpaceZoomHud
 import com.example.procamerax.ui.components.viewfinder.FocusExposureOverlay
 import com.example.procamerax.ui.components.viewfinder.GridAndLevelOverlay
+import com.example.procamerax.ui.components.viewfinder.rememberFocusExposureState
 import com.example.procamerax.viewmodel.AspectRatioMode
 import com.example.procamerax.viewmodel.CameraMode
 import com.example.procamerax.viewmodel.CameraUiState
@@ -109,9 +115,11 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+import kotlin.math.sign
 
 @OptIn(ExperimentalCamera2Interop::class)
 @Composable
@@ -398,6 +406,17 @@ fun CameraScreen(
     }
 
     // Real-time Camera2Interop Pro Controls (WB, ISO, Shutter Speed, Manual Focus) without rebinding!
+    // Only depend on exposureCompensationIndex when manual ISO or Shutter overrides AE; otherwise
+    // hardware AE handles exposureCompensationIndex directly without Camera2 session churn.
+    val proManualEvIndex = if (
+        uiState.cameraMode == CameraMode.PRO &&
+        (uiState.proIso != null || uiState.proShutterSpeedNs != null)
+    ) {
+        uiState.exposureCompensationIndex
+    } else {
+        0
+    }
+
     LaunchedEffect(
         cameraControl,
         cameraInfo,
@@ -406,7 +425,7 @@ fun CameraScreen(
         uiState.proIso,
         uiState.proShutterSpeedNs,
         uiState.proFocusDistance,
-        uiState.exposureCompensationIndex,
+        proManualEvIndex,
         uiState.exposureCompensationStep,
         minFocusDistance
     ) {
@@ -668,7 +687,39 @@ fun CameraScreen(
                 .fillMaxWidth(),
             contentAlignment = Alignment.Center
         ) {
-            var focusPoint by remember { mutableStateOf<Offset?>(null) }
+            val focusExposureState = rememberFocusExposureState()
+            val density = LocalDensity.current
+
+            LaunchedEffect(uiState.lensFacing) {
+                focusExposureState.dismiss()
+            }
+
+            val triggerFocusAt: (Offset) -> Unit = { offset ->
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                val latestState = viewModel.uiState.value
+                val factory = previewView.meteringPointFactory
+                val point = factory.createPoint(offset.x, offset.y)
+                val isProMode = latestState.cameraMode == CameraMode.PRO
+                val useAf = !isProMode || latestState.proFocusDistance == null
+                val useAe = !isProMode || (latestState.proIso == null && latestState.proShutterSpeedNs == null)
+                val flags = (if (useAf) FocusMeteringAction.FLAG_AF else 0) or
+                    (if (useAe) FocusMeteringAction.FLAG_AE else 0)
+                if (flags != 0) {
+                    val action = FocusMeteringAction.Builder(point, flags).build()
+                    cameraControl?.startFocusAndMetering(action)
+                }
+                focusExposureState.showFocusAt(
+                    point = offset,
+                    currentExposureIndex = latestState.exposureCompensationIndex,
+                    minExposureIndex = latestState.exposureCompensationRangeMin,
+                    maxExposureIndex = latestState.exposureCompensationRangeMax
+                )
+            }
+
+            val currentCameraInfo by rememberUpdatedState(cameraInfo)
+            val currentTriggerFocusAt by rememberUpdatedState(triggerFocusAt)
+            val viewfinderEvDragRangePx = with(density) { 150.dp.toPx() }
+            val currentViewfinderEvDragRangePx by rememberUpdatedState(viewfinderEvDragRangePx)
 
             val aspectRatioModifier = uiState.aspectRatioMode.ratioValue?.let { ratio ->
                 Modifier
@@ -685,41 +736,128 @@ fun CameraScreen(
                     factory = { previewView },
                     modifier = Modifier
                         .fillMaxSize()
-                        .pointerInput(cameraControl, cameraInfo) {
-                            detectTransformGestures { _, _, zoom, _ ->
-                                cameraInfo?.zoomState?.value?.let { currentZoomState ->
-                                    val currentRatio = currentZoomState.zoomRatio
-                                    val minRatio = currentZoomState.minZoomRatio
-                                    val maxRatio = currentZoomState.maxZoomRatio
-                                    val newRatio = (currentRatio * zoom).coerceIn(minRatio, maxRatio)
-                                    viewModel.setZoomLevel(newRatio)
+                        .pointerInput(focusExposureState) {
+                            awaitEachGesture {
+                                val firstDown = awaitFirstDown(requireUnconsumed = false)
+                                var gestureMode = ViewfinderGestureMode.UNDETERMINED
+                                var maxPointersSeen = 1
+                                var totalSingleFingerDelta = Offset.Zero
+                                val touchSlop = viewConfiguration.touchSlop
+
+                                try {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val pressedChanges = event.changes.filter { it.pressed }
+                                        if (pressedChanges.size > maxPointersSeen) {
+                                            maxPointersSeen = pressedChanges.size
+                                        }
+
+                                        if (pressedChanges.isEmpty()) {
+                                            if (gestureMode == ViewfinderGestureMode.EV_DRAG) {
+                                                focusExposureState.endEvDrag()
+                                            } else if (
+                                                gestureMode == ViewfinderGestureMode.UNDETERMINED &&
+                                                maxPointersSeen == 1 &&
+                                                !event.changes.any { it.isConsumed }
+                                            ) {
+                                                currentTriggerFocusAt(firstDown.position)
+                                            }
+                                            break
+                                        }
+
+                                        if (pressedChanges.size >= 2) {
+                                            if (gestureMode == ViewfinderGestureMode.EV_DRAG) {
+                                                focusExposureState.endEvDrag()
+                                            }
+                                            gestureMode = ViewfinderGestureMode.PINCH_ZOOM
+                                            val zoomChange = event.calculateZoom()
+                                            if (zoomChange != 1f) {
+                                                val zoomBounds = currentCameraInfo?.zoomState?.value
+                                                val minRatio = zoomBounds?.minZoomRatio ?: 1f
+                                                val maxRatio = zoomBounds?.maxZoomRatio ?: 10f
+                                                val baseRatio = viewModel.uiState.value.zoomLevel
+                                                val newRatio = (baseRatio * zoomChange).coerceIn(minRatio, maxRatio)
+                                                viewModel.setZoomLevel(newRatio)
+                                            }
+                                            event.changes.forEach { change ->
+                                                if (change.positionChanged()) {
+                                                    change.consume()
+                                                }
+                                            }
+                                            continue
+                                        }
+
+                                        // Single pressed pointer
+                                        val change = pressedChanges[0]
+                                        when (gestureMode) {
+                                            ViewfinderGestureMode.PINCH_ZOOM -> {
+                                                if (change.positionChanged()) {
+                                                    change.consume()
+                                                }
+                                            }
+                                            ViewfinderGestureMode.UNDETERMINED -> {
+                                                val delta = change.positionChange()
+                                                totalSingleFingerDelta += delta
+                                                if (totalSingleFingerDelta.getDistance() > touchSlop) {
+                                                    val latestState = viewModel.uiState.value
+                                                    val minEv = latestState.exposureCompensationRangeMin
+                                                    val maxEv = latestState.exposureCompensationRangeMax
+                                                    val canDragEv =
+                                                        focusExposureState.isOverlayVisible && maxEv > minEv
+                                                    val isVerticalSwipe =
+                                                        abs(totalSingleFingerDelta.y) >
+                                                            abs(totalSingleFingerDelta.x) * 1.15f
+
+                                                    if (canDragEv && isVerticalSwipe && maxPointersSeen == 1) {
+                                                        gestureMode = ViewfinderGestureMode.EV_DRAG
+                                                        focusExposureState.beginEvDrag(
+                                                            currentExposureIndex = latestState.exposureCompensationIndex,
+                                                            minExposureIndex = minEv,
+                                                            maxExposureIndex = maxEv
+                                                        )
+                                                        change.consume()
+                                                        val initialExcessDy =
+                                                            totalSingleFingerDelta.y -
+                                                                touchSlop * sign(totalSingleFingerDelta.y)
+                                                        focusExposureState.updateEvDragByDelta(
+                                                            dragDeltaYPx = initialExcessDy,
+                                                            dragRangePx = currentViewfinderEvDragRangePx,
+                                                            minExposureIndex = minEv,
+                                                            maxExposureIndex = maxEv,
+                                                            onExposureIndexChanged = { newIndex ->
+                                                                viewModel.setExposureCompensationIndex(newIndex)
+                                                            }
+                                                        )
+                                                    } else {
+                                                        gestureMode = ViewfinderGestureMode.CANCELLED
+                                                    }
+                                                }
+                                            }
+                                            ViewfinderGestureMode.EV_DRAG -> {
+                                                val dy = change.positionChange().y
+                                                if (dy != 0f) {
+                                                    change.consume()
+                                                    val latestState = viewModel.uiState.value
+                                                    focusExposureState.updateEvDragByDelta(
+                                                        dragDeltaYPx = dy,
+                                                        dragRangePx = currentViewfinderEvDragRangePx,
+                                                        minExposureIndex = latestState.exposureCompensationRangeMin,
+                                                        maxExposureIndex = latestState.exposureCompensationRangeMax,
+                                                        onExposureIndexChanged = { newIndex ->
+                                                            viewModel.setExposureCompensationIndex(newIndex)
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                            ViewfinderGestureMode.CANCELLED -> Unit
+                                        }
+                                    }
+                                } finally {
+                                    if (gestureMode == ViewfinderGestureMode.EV_DRAG) {
+                                        focusExposureState.endEvDrag()
+                                    }
                                 }
                             }
-                        }
-                        .pointerInput(
-                            cameraControl,
-                            uiState.cameraMode,
-                            uiState.proFocusDistance,
-                            uiState.proIso,
-                            uiState.proShutterSpeedNs
-                        ) {
-                            detectTapGestures(
-                                onTap = { offset ->
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    val factory = previewView.meteringPointFactory
-                                    val point = factory.createPoint(offset.x, offset.y)
-                                    val isProMode = uiState.cameraMode == CameraMode.PRO
-                                    val useAf = !isProMode || uiState.proFocusDistance == null
-                                    val useAe = !isProMode || (uiState.proIso == null && uiState.proShutterSpeedNs == null)
-                                    val flags = (if (useAf) FocusMeteringAction.FLAG_AF else 0) or
-                                        (if (useAe) FocusMeteringAction.FLAG_AE else 0)
-                                    if (flags != 0) {
-                                        val action = FocusMeteringAction.Builder(point, flags).build()
-                                        cameraControl?.startFocusAndMetering(action)
-                                    }
-                                    focusPoint = offset
-                                }
-                            )
                         }
                 )
 
@@ -731,14 +869,16 @@ fun CameraScreen(
 
                 // Tap-to-Focus Ring & Interactive Vertical Exposure Compensation Slider
                 FocusExposureOverlay(
-                    focusPoint = focusPoint,
+                    focusPoint = focusExposureState.focusPoint,
                     exposureIndex = uiState.exposureCompensationIndex,
                     minExposureIndex = uiState.exposureCompensationRangeMin,
                     maxExposureIndex = uiState.exposureCompensationRangeMax,
                     exposureStep = uiState.exposureCompensationStep,
                     onExposureIndexChanged = { newIndex ->
                         viewModel.setExposureCompensationIndex(newIndex)
-                    }
+                    },
+                    state = focusExposureState,
+                    onTapFocus = currentTriggerFocusAt
                 )
 
                 // Space Zoom HUD with Real Gyro/Accelerometer Stability Lock
@@ -1026,5 +1166,12 @@ private fun applyProCaptureRequestOptions(
     } catch (e: Exception) {
         Log.e("CameraScreen", "Failed to apply Pro camera controls", e)
     }
+}
+
+private enum class ViewfinderGestureMode {
+    UNDETERMINED,
+    PINCH_ZOOM,
+    EV_DRAG,
+    CANCELLED
 }
 
