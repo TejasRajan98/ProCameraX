@@ -36,8 +36,10 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.math.pow
 
 enum class CameraMode(val label: String) {
+    NIGHT("NIGHT"),
     PHOTO("PHOTO"),
     VIDEO("VIDEO"),
     PRO("PRO")
@@ -100,7 +102,7 @@ data class CameraUiState(
     val videoQuality: Quality = Quality.FHD,
     val videoFps: FpsMode = FpsMode.AUTO,
     val isVideoHdrEnabled: Boolean = false,
-    val isAutoNightModeEnabled: Boolean = false,
+    val isAutoNightModeEnabled: Boolean = true,
     val isNightModeActive: Boolean = false,
     val photoCaptureProgress: Int? = null,
     val photoFlashMode: Int = ImageCapture.FLASH_MODE_AUTO,
@@ -124,6 +126,9 @@ data class CameraUiState(
     val shutterFlashTrigger: Long = 0L,
     val isScreenFlashActive: Boolean = false,
     val ambientLux: Float? = null,
+    val cameraSceneLux: Float? = null,
+    val ambientLuxAtNightActivation: Float? = null,
+    val hasExtensionSceneLuxSample: Boolean = false,
     val histogramBins: List<Float> = List(64) { 0f }
 )
 
@@ -141,9 +146,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         key = KEY_FRONT_FLASH_MODE,
         defaultMode = ImageCapture.FLASH_MODE_OFF
     )
+    private val initialAutoNightModeEnabled: Boolean =
+        prefs?.getBoolean(KEY_AUTO_NIGHT_MODE, true) ?: true
 
     private val _uiState = MutableStateFlow(
         CameraUiState(
+            isAutoNightModeEnabled = initialAutoNightModeEnabled,
             photoFlashMode = initialBackFlashMode,
             backPhotoFlashMode = initialBackFlashMode,
             frontPhotoFlashMode = initialFrontFlashMode
@@ -264,7 +272,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 lensFacing = newLens,
                 photoFlashMode = newFlashMode,
                 zoomLevel = 1f,
-                exposureCompensationIndex = 0
+                exposureCompensationIndex = 0,
+                isNightModeActive = current.cameraMode == CameraMode.NIGHT,
+                cameraSceneLux = null,
+                ambientLuxAtNightActivation = null,
+                hasExtensionSceneLuxSample = false
             )
         }
     }
@@ -272,7 +284,33 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun setCameraMode(mode: CameraMode) {
         if (uiState.value.isRecording) return
         cancelCountdown()
-        _uiState.update { it.copy(cameraMode = mode) }
+        _uiState.update { current ->
+            if (current.cameraMode == mode) {
+                current
+            } else {
+                when (mode) {
+                    CameraMode.NIGHT -> current.copy(
+                        cameraMode = mode,
+                        isNightModeActive = true,
+                        ambientLuxAtNightActivation = null,
+                        hasExtensionSceneLuxSample = false
+                    )
+                    CameraMode.PHOTO -> current.copy(
+                        cameraMode = mode,
+                        isNightModeActive = false,
+                        cameraSceneLux = null,
+                        ambientLuxAtNightActivation = null,
+                        hasExtensionSceneLuxSample = false
+                    )
+                    CameraMode.VIDEO, CameraMode.PRO -> current.copy(
+                        cameraMode = mode,
+                        isNightModeActive = false,
+                        ambientLuxAtNightActivation = null,
+                        hasExtensionSceneLuxSample = false
+                    )
+                }
+            }
+        }
     }
 
     fun setZoomLevel(zoom: Float) {
@@ -318,16 +356,38 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (uiState.value.isRecording) return
         _uiState.update { current ->
             val nextEnabled = !current.isAutoNightModeEnabled
+            prefs?.edit()?.putBoolean(KEY_AUTO_NIGHT_MODE, nextEnabled)?.apply()
             current.copy(
                 isAutoNightModeEnabled = nextEnabled,
-                isNightModeActive = if (!nextEnabled) false else current.isNightModeActive
+                isNightModeActive = if (!nextEnabled) false else current.isNightModeActive,
+                ambientLuxAtNightActivation = if (!nextEnabled) null else current.ambientLuxAtNightActivation,
+                hasExtensionSceneLuxSample = if (!nextEnabled) false else current.hasExtensionSceneLuxSample
             )
         }
     }
 
     fun setNightModeActive(active: Boolean) {
         if (uiState.value.isRecording) return
-        _uiState.update { it.copy(isNightModeActive = active) }
+        _uiState.update { current ->
+            if (current.isNightModeActive == active) {
+                current
+            } else if (current.photoCaptureProgress != null && current.isAutoNightModeEnabled) {
+                // Keep session stable while a Night Sight multi-frame capture is actively saving
+                current
+            } else if (active) {
+                current.copy(
+                    isNightModeActive = true,
+                    ambientLuxAtNightActivation = current.ambientLux,
+                    hasExtensionSceneLuxSample = false
+                )
+            } else {
+                current.copy(
+                    isNightModeActive = false,
+                    ambientLuxAtNightActivation = null,
+                    hasExtensionSceneLuxSample = false
+                )
+            }
+        }
     }
 
     fun cyclePhotoFlashMode() {
@@ -337,7 +397,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
                 else -> ImageCapture.FLASH_MODE_OFF
             }
-            if (current.lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            val updated = if (current.lensFacing == CameraSelector.LENS_FACING_FRONT) {
                 prefs?.edit()?.putInt(KEY_FRONT_FLASH_MODE, nextMode)?.apply()
                 current.copy(
                     photoFlashMode = nextMode,
@@ -349,6 +409,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     photoFlashMode = nextMode,
                     backPhotoFlashMode = nextMode
                 )
+            }
+            if ( updated.cameraMode == CameraMode.PHOTO &&
+                isFlashOverridingAutoNight(updated) &&
+                updated.isNightModeActive
+            ) {
+                updated.copy(
+                    isNightModeActive = false,
+                    ambientLuxAtNightActivation = null,
+                    hasExtensionSceneLuxSample = false
+                )
+            } else {
+                updated
             }
         }
     }
@@ -439,11 +511,79 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateAmbientLux(lux: Float) {
+        if (!lux.isFinite() || lux < 0f) return
         _uiState.update { it.copy(ambientLux = lux) }
+    }
+
+    fun updateCameraSceneLux(sceneLux: Float, fromExtensionSession: Boolean = false) {
+        if (!sceneLux.isFinite() || sceneLux < 0f) return
+        _uiState.update { current ->
+            current.copy(
+                cameraSceneLux = sceneLux,
+                hasExtensionSceneLuxSample = if (fromExtensionSession && current.isNightModeActive) {
+                    true
+                } else {
+                    current.hasExtensionSceneLuxSample
+                }
+            )
+        }
+    }
+
+    internal fun isFlashOverridingAutoNight(state: CameraUiState = uiState.value): Boolean {
+        return if (state.lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            state.photoFlashMode != ImageCapture.FLASH_MODE_OFF
+        } else {
+            state.photoFlashMode == ImageCapture.FLASH_MODE_ON
+        }
+    }
+
+    /**
+     * Evaluates whether Auto Night Sight should transition ON (`true`), OFF (`false`),
+     * or stay in its current state (`null`).
+     */
+    internal fun evaluateAutoNightTarget(state: CameraUiState = uiState.value): Boolean? {
+        if (state.cameraMode == CameraMode.NIGHT) {
+            return if (!state.isNightModeActive) true else null
+        }
+
+        if (!state.isAutoNightModeEnabled ||
+            state.cameraMode != CameraMode.PHOTO ||
+            isFlashOverridingAutoNight(state)
+        ) {
+            return if (state.isNightModeActive) false else null
+        }
+
+        if (state.photoCaptureProgress != null) {
+            return null
+        }
+
+        return if (!state.isNightModeActive) {
+            val sceneLux = state.cameraSceneLux
+            if (sceneLux != null) {
+                if (sceneLux < SCENE_LUX_ENTER_THRESHOLD) true else null
+            } else {
+                val ambient = state.ambientLux
+                if (ambient != null && ambient < AMBIENT_LUX_ENTER_THRESHOLD) true else null
+            }
+        } else {
+            if (state.hasExtensionSceneLuxSample && state.cameraSceneLux != null) {
+                if (state.cameraSceneLux > SCENE_LUX_EXIT_THRESHOLD) false else null
+            } else {
+                val ambient = state.ambientLux
+                val baselineAmbient = state.ambientLuxAtNightActivation
+                val adaptiveExitThreshold = if (baselineAmbient != null) {
+                    maxOf(AMBIENT_LUX_EXIT_MIN_THRESHOLD, baselineAmbient * 2.2f + 15.0f)
+                } else {
+                    AMBIENT_LUX_EXIT_MIN_THRESHOLD
+                }
+                if (ambient != null && ambient > adaptiveExitThreshold) false else null
+            }
+        }
     }
 
     internal fun shouldTriggerFrontScreenFlash(state: CameraUiState = uiState.value): Boolean {
         if (state.lensFacing != CameraSelector.LENS_FACING_FRONT) return false
+        if (state.cameraMode == CameraMode.NIGHT) return false
         return when (state.photoFlashMode) {
             ImageCapture.FLASH_MODE_ON -> true
             ImageCapture.FLASH_MODE_AUTO -> {
@@ -494,14 +634,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun capturePhoto() {
         val imageCapture = imageCapture ?: return
+        if (uiState.value.photoCaptureProgress != null) return
+
         viewModelScope.launch {
             val useScreenFlash = shouldTriggerFrontScreenFlash()
+            val showImmediateHoldStill = !useScreenFlash && (
+                uiState.value.cameraMode == CameraMode.NIGHT ||
+                    (uiState.value.cameraMode == CameraMode.PHOTO && uiState.value.isNightModeActive)
+            )
 
             if (useScreenFlash) {
                 _uiState.update { it.copy(isScreenFlashActive = true) }
                 delay(180L)
             } else {
-                _uiState.update { it.copy(shutterFlashTrigger = System.currentTimeMillis()) }
+                _uiState.update {
+                    it.copy(
+                        shutterFlashTrigger = System.currentTimeMillis(),
+                        photoCaptureProgress = if (showImmediateHoldStill) 0 else it.photoCaptureProgress
+                    )
+                }
             }
 
             val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US).format(System.currentTimeMillis())
@@ -665,6 +816,46 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         internal const val PREFS_NAME = "procamerax_preferences"
         internal const val KEY_BACK_FLASH_MODE = "pref_back_photo_flash_mode"
         internal const val KEY_FRONT_FLASH_MODE = "pref_front_photo_flash_mode"
+        internal const val KEY_AUTO_NIGHT_MODE = "pref_auto_night_mode"
         internal const val FRONT_AUTO_FLASH_LUX_THRESHOLD = 20.0f
+        internal const val SCENE_LUX_ENTER_THRESHOLD = 22.0f
+        internal const val SCENE_LUX_EXIT_THRESHOLD = 38.0f
+        internal const val AMBIENT_LUX_ENTER_THRESHOLD = 15.0f
+        internal const val AMBIENT_LUX_EXIT_MIN_THRESHOLD = 35.0f
+        internal const val AUTO_NIGHT_ENTER_DEBOUNCE_MS = 1000L
+        internal const val AUTO_NIGHT_EXIT_DEBOUNCE_MS = 1500L
+        private const val DEFAULT_LENS_APERTURE = 1.8
+
+        /**
+         * Estimates unbiased camera scene illuminance (lux) from Camera2 Auto-Exposure metadata,
+         * removing intentional user exposure compensation bias so manual EV adjustments do not
+         * falsely trigger or suppress Auto Night Sight.
+         */
+        internal fun computeSceneLuxFromCaptureMetadata(
+            iso: Int?,
+            exposureTimeNs: Long?,
+            aperture: Float?,
+            aeCompensationIndex: Int = 0,
+            exposureCompensationStep: Float = 0.33f,
+            aeMode: Int? = null
+        ): Float? {
+            if (aeMode == CameraMetadata.CONTROL_AE_MODE_OFF) return null
+            if (iso == null || iso <= 0) return null
+            if (exposureTimeNs == null || exposureTimeNs <= 0L) return null
+
+            val fNumber = if (aperture != null && aperture > 0f) {
+                aperture.toDouble()
+            } else {
+                DEFAULT_LENS_APERTURE
+            }
+            val exposureSeconds = exposureTimeNs.toDouble() / 1_000_000_000.0
+            if (exposureSeconds <= 0.0) return null
+
+            val effectiveLux = 2.5 * ((fNumber * fNumber) / exposureSeconds) * (100.0 / iso.toDouble())
+            val evBias = aeCompensationIndex.toDouble() * exposureCompensationStep.toDouble()
+            val unbiasedLux = effectiveLux * 2.0.pow(evBias)
+
+            return unbiasedLux.toFloat().takeIf { it.isFinite() && it >= 0f }
+        }
     }
 }

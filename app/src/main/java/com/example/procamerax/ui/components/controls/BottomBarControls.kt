@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
@@ -184,6 +185,7 @@ fun BottomBarControls(
                 isRecording = uiState.isRecording,
                 isCountdownActive = uiState.countdownSecondsRemaining != null,
                 mode = uiState.cameraMode,
+                uiRotationDegrees = uiRotationDegrees,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     onShutterClick()
@@ -213,10 +215,10 @@ fun BottomBarControls(
             }
         }
 
-        // Mode Selector Row (PHOTO | VIDEO | PRO)
+        // Mode Selector Row (NIGHT | PHOTO | VIDEO | PRO)
         Row(
             modifier = Modifier.padding(top = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(20.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             CameraMode.entries.forEach { mode ->
@@ -231,7 +233,7 @@ fun BottomBarControls(
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             onSelectMode(mode)
                         }
-                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -257,6 +259,7 @@ fun ShutterButton(
     isRecording: Boolean,
     isCountdownActive: Boolean,
     mode: CameraMode,
+    uiRotationDegrees: Float = 0f,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -266,7 +269,10 @@ fun ShutterButton(
         label = "shutterInnerRadius"
     )
 
-    val ringColor = if (mode == CameraMode.PRO) Color.Yellow else Color.White
+    val ringColor = when (mode) {
+        CameraMode.PRO, CameraMode.NIGHT -> Color.Yellow
+        else -> Color.White
+    }
 
     Box(
         modifier = modifier
@@ -298,6 +304,16 @@ fun ShutterButton(
                 } else {
                     drawCircle(color = color, radius = innerRadius.dp.toPx())
                 }
+            }
+            if (mode == CameraMode.NIGHT && !isRecording) {
+                Icon(
+                    imageVector = Icons.Default.NightsStay,
+                    contentDescription = "Night Sight Shutter",
+                    tint = Color.Black,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .rotate(uiRotationDegrees)
+                )
             }
         }
     }

@@ -2,20 +2,21 @@
 
 [![Download APK](https://img.shields.github.com/badge/Download-APK-brightgreen.svg?style=for-the-badge&logo=android)](https://github.com/TejasRajan98/ProCameraX/releases)
 
-ProCameraX is a feature-rich, high-performance Android camera application built using **Jetpack Compose**, **CameraX 1.4**, and **Camera2Interop**. Inspired by Google Camera (GCam) and flagship Pro camera suites, it features a responsive dark UI and unlocks advanced hardware capabilities on Android devices.
+ProCameraX is a feature-rich, high-performance Android camera application built using **Jetpack Compose**, **CameraX 1.6**, and **Camera2Interop**. Inspired by Google Camera (GCam) and flagship Pro camera suites, it features a responsive dark UI and unlocks advanced hardware capabilities on Android devices.
 
 ---
 
 ## 🌟 Key Features
 
-### 📸 Photo Mode
-- **Debounced Auto Night Mode (Night Sight)**: Continuously monitors ambient light levels using the device's light sensor with hysteresis (`< 7 lux` to activate, `> 15 lux` to deactivate, sustained for 1.5s) to prevent preview rebind stutters while switching to OEM Night Sight extensions (`ExtensionMode.NIGHT`).
-- **Hold Still Progress UX**: During Night Mode capture, a glassmorphic circular progress overlay displays processing percentage.
+### 📸 Photo & Night Sight Modes
+- **Dedicated Night Mode (`NIGHT`)**: Dedicated bottom-bar Night Sight mode alongside `PHOTO`, `VIDEO`, and `PRO` that binds platform Camera2 Extensions (`ExtensionMode.NIGHT`) with maximum-quality multi-frame fusion on both rear and front lenses.
+- **Debounced Auto Night Sight (`PHOTO`)**: Computes unbiased camera scene illuminance (`lux`) directly from Camera2 Auto-Exposure metadata (`SENSOR_SENSITIVITY`, `SENSOR_EXPOSURE_TIME`, `LENS_APERTURE`) paired with ambient light sensor fallback and adaptive hysteresis to smoothly activate Night Sight in low-light scenes without ping-ponging.
+- **Hold Still Progress UX**: During Night Sight capture, a glassmorphic circular progress overlay displays real-time multi-frame processing percentage.
 - **Tap-to-Focus + Interactive EV Exposure Slider**: Tap anywhere on the viewfinder to focus and drag vertically on the sun slider to adjust exposure compensation (`EV`) in real time.
 - **Front Camera Screen Flash & Shutter Blink**: Automatically boosts screen brightness with a full-white screen flash for front-facing low-light selfies, plus tactile shutter flash feedback.
 - **Shutter Countdown Timer**: Built-in `OFF`, `3s`, and `10s` countdown timer with large visual overlay.
 - **Aspect Ratio Framing**: Switch between `4:3`, `16:9`, `1:1`, and `FULL` aspect ratios.
-- **Ultra HDR Support**: Captures and processes Ultra HDR (`JPEG_ULTRA_HDR`) photos on supported Android 14+ devices.
+- **Ultra HDR Support**: Captures and processes Ultra HDR (`JPEG_ULTRA_HDR`) photos on supported Android 14+ devices, including Night Sight when supported by Camera2 Extensions.
 
 ### 🎛️ Pro Manual Mode
 - **Real-Time Camera2Interop Controls**: Adjust **White Balance (WB)**, **ISO** (`100`–`3200`), **Shutter Speed** (`1/4000s`–`1s`), **Exposure Compensation (EV)**, and **Manual Focus Distance** (`Macro` to `∞`) live via `Camera2CameraControl` without rebinding the camera session.
@@ -51,8 +52,8 @@ ProCameraX is a feature-rich, high-performance Android camera application built 
 ## 🛠️ Build & Installation
 
 ### Requirements
-- **Android Studio Jellyfish** or higher
-- **Android SDK 34** (targetSdk)
+- **Android Studio** (AGP 9.4+ / Gradle 9.6+)
+- **Compile SDK 37** (`targetSdk` 34)
 - **Minimum SDK 26** (Android 8.0)
 
 ### Compile & Run Unit Tests

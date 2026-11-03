@@ -9,9 +9,12 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
 import android.os.Build
 import android.util.Log
@@ -104,7 +107,6 @@ import com.example.procamerax.ui.components.overlays.SpaceZoomHud
 import com.example.procamerax.ui.components.viewfinder.FocusExposureOverlay
 import com.example.procamerax.ui.components.viewfinder.GridAndLevelOverlay
 import com.example.procamerax.ui.components.viewfinder.rememberFocusExposureState
-import com.example.procamerax.viewmodel.AspectRatioMode
 import com.example.procamerax.viewmodel.CameraMode
 import com.example.procamerax.viewmodel.CameraUiState
 import com.example.procamerax.viewmodel.CameraViewModel
@@ -113,7 +115,6 @@ import com.example.procamerax.viewmodel.WhiteBalanceMode
 import kotlinx.coroutines.delay
 import java.util.Locale
 import java.util.concurrent.Executors
-import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.abs
 import kotlin.math.pow
@@ -161,7 +162,11 @@ fun CameraScreen(
     var cameraInfo by remember { mutableStateOf<CameraInfo?>(null) }
     var zoomState by remember { mutableStateOf<ZoomState?>(null) }
     var minFocusDistance by remember { mutableFloatStateOf(10f) }
-    var isNightExtensionAvailable by remember { mutableStateOf(false) }
+    var availableNightExtensionMode by remember { mutableStateOf<Int?>(null) }
+    var isNightExtensionChecked by remember { mutableStateOf(false) }
+    var boundExtensionMode by remember { mutableStateOf<Int?>(null) }
+    var activeAutoExtensionSubMode by remember { mutableStateOf<Int?>(null) }
+    var extensionsManagerRef by remember { mutableStateOf<ExtensionsManager?>(null) }
     var isUltraHdrActive by remember { mutableStateOf(false) }
 
     DisposableEffect(cameraInfo) {
@@ -172,6 +177,31 @@ fun CameraScreen(
         liveData?.observeForever(observer)
         onDispose {
             liveData?.removeObserver(observer)
+        }
+    }
+
+    // Observe dynamic sub-mode if ExtensionMode.AUTO was used as fallback
+    DisposableEffect(cameraInfo, boundExtensionMode, extensionsManagerRef) {
+        val info = cameraInfo
+        val extMgr = extensionsManagerRef
+        if (info != null && extMgr != null && boundExtensionMode == ExtensionMode.AUTO) {
+            val extInfo = runCatching { extMgr.getCameraExtensionsInfo(info) }.getOrNull()
+            val liveData = if (extInfo?.isCurrentExtensionModeAvailable == true) {
+                extInfo.currentExtensionMode
+            } else {
+                null
+            }
+            val observer = Observer<Int> { mode ->
+                activeAutoExtensionSubMode = mode
+            }
+            liveData?.observeForever(observer)
+            onDispose {
+                liveData?.removeObserver(observer)
+                activeAutoExtensionSubMode = null
+            }
+        } else {
+            activeAutoExtensionSubMode = null
+            onDispose {}
         }
     }
 
@@ -234,51 +264,41 @@ fun CameraScreen(
         }
     }
 
-    // Check Night Sight Extension Support when lens changes
+    // Check Night Sight Extension Support (Camera2 Extensions / Pixel Camera Services) when lens changes
     LaunchedEffect(uiState.lensFacing) {
-        isNightExtensionAvailable = try {
+        isNightExtensionChecked = false
+        availableNightExtensionMode = try {
             val cameraProvider = context.getCameraProvider()
             val extensionsManager = context.getExtensionsManager(cameraProvider)
+            extensionsManagerRef = extensionsManager
             val baseSelector = CameraSelector.Builder()
                 .requireLensFacing(uiState.lensFacing)
                 .build()
-            extensionsManager.isExtensionAvailable(baseSelector, ExtensionMode.NIGHT)
-        } catch (_: Exception) {
-            false
+            resolveSupportedNightExtensionMode(extensionsManager, baseSelector)
+        } catch (e: Exception) {
+            Log.w("CameraScreen", "Failed to check Night Sight extension availability", e)
+            null
+        } finally {
+            isNightExtensionChecked = true
         }
     }
 
-    // Ambient Light Sensor for Front Camera Auto Screen Flash & Auto Night Mode
-    // Auto Night Mode activates below 7 lux sustained for 1.5s; deactivates above 15 lux sustained for 1.5s
+    // Ambient Light Sensor for Front Camera Auto Screen Flash & Auto Night Mode reference
     val sensorManager = remember(context) {
         context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     }
     val lightSensor = remember(sensorManager) {
         sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
     }
-    var pendingNightModeTarget by remember { mutableStateOf<Boolean?>(null) }
 
     DisposableEffect(lightSensor) {
         if (lightSensor != null) {
             val listener = object : SensorEventListener {
                 override fun onSensorChanged(event: SensorEvent?) {
                     val lux = event?.values?.getOrNull(0) ?: return
-                    val currentState = viewModel.uiState.value
                     // Ignore transient brightness spikes caused by the screen flash itself
-                    if (currentState.isScreenFlashActive) return
-
+                    if (viewModel.uiState.value.isScreenFlashActive) return
                     viewModel.updateAmbientLux(lux)
-
-                    if (currentState.isAutoNightModeEnabled) {
-                        val currentlyActive = currentState.isNightModeActive
-                        if (!currentlyActive && lux < 7.0f) {
-                            pendingNightModeTarget = true
-                        } else if (currentlyActive && lux > 15.0f) {
-                            pendingNightModeTarget = false
-                        } else if (lux in 7.0f..15.0f) {
-                            pendingNightModeTarget = null
-                        }
-                    }
                 }
 
                 override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -292,27 +312,36 @@ fun CameraScreen(
         }
     }
 
-    LaunchedEffect(uiState.isAutoNightModeEnabled) {
-        if (!uiState.isAutoNightModeEnabled) {
-            pendingNightModeTarget = null
-            viewModel.setNightModeActive(false)
+    val desiredNightModeTarget = remember(
+        uiState.cameraMode,
+        uiState.isAutoNightModeEnabled,
+        uiState.isNightModeActive,
+        uiState.photoFlashMode,
+        uiState.lensFacing,
+        uiState.photoCaptureProgress,
+        uiState.cameraSceneLux,
+        uiState.ambientLux,
+        uiState.ambientLuxAtNightActivation,
+        uiState.hasExtensionSceneLuxSample,
+        availableNightExtensionMode,
+        isNightExtensionChecked
+    ) {
+        if (isNightExtensionChecked && availableNightExtensionMode == null) {
+            if (uiState.isNightModeActive) false else null
         } else {
-            val lux = uiState.ambientLux
-            if (lux != null) {
-                if (!uiState.isNightModeActive && lux < 7.0f) {
-                    pendingNightModeTarget = true
-                } else if (uiState.isNightModeActive && lux > 15.0f) {
-                    pendingNightModeTarget = false
-                }
-            }
+            viewModel.evaluateAutoNightTarget(uiState)
         }
     }
 
-    LaunchedEffect(pendingNightModeTarget, uiState.isAutoNightModeEnabled) {
-        val target = pendingNightModeTarget ?: return@LaunchedEffect
-        if (!uiState.isAutoNightModeEnabled) return@LaunchedEffect
-        delay(1500L)
-        if (pendingNightModeTarget == target && uiState.isNightModeActive != target) {
+    LaunchedEffect(desiredNightModeTarget) {
+        val target = desiredNightModeTarget ?: return@LaunchedEffect
+        val debounceMs = if (target) {
+            CameraViewModel.AUTO_NIGHT_ENTER_DEBOUNCE_MS
+        } else {
+            CameraViewModel.AUTO_NIGHT_EXIT_DEBOUNCE_MS
+        }
+        delay(debounceMs)
+        if (viewModel.uiState.value.isNightModeActive != target) {
             viewModel.setNightModeActive(target)
         }
     }
@@ -373,9 +402,19 @@ fun CameraScreen(
         options.filter { it in minZoom..maxZoom }.distinct().sorted().toList()
     }
 
-    // Dynamic Zoom Effect
-    LaunchedEffect(uiState.zoomLevel, cameraControl) {
-        cameraControl?.setZoomRatio(uiState.zoomLevel)
+    // Dynamic Zoom Effect (clamped to current session's valid zoom bounds)
+    LaunchedEffect(uiState.zoomLevel, cameraControl, cameraInfo) {
+        val control = cameraControl ?: return@LaunchedEffect
+        val bounds = cameraInfo?.zoomState?.value
+        val clampedZoom = if (bounds != null) {
+            uiState.zoomLevel.coerceIn(bounds.minZoomRatio, bounds.maxZoomRatio)
+        } else {
+            uiState.zoomLevel
+        }
+        control.setZoomRatio(clampedZoom)
+        if (clampedZoom != uiState.zoomLevel) {
+            viewModel.setZoomLevel(clampedZoom)
+        }
     }
 
     // Exposure Compensation Effect
@@ -384,10 +423,23 @@ fun CameraScreen(
     }
 
     // Flash Effect
-    LaunchedEffect(uiState.photoFlashMode, imageCaptureUseCase, uiState.lensFacing) {
+    LaunchedEffect(
+        uiState.photoFlashMode,
+        uiState.cameraMode,
+        imageCaptureUseCase,
+        uiState.lensFacing,
+        boundExtensionMode,
+        cameraInfo
+    ) {
         if (uiState.cameraMode != CameraMode.VIDEO) {
-            // Front camera uses screen flash overlay, so hardware flash stays off on front lens
-            val effectiveFlash = if (uiState.lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            val hasHardwareFlash = cameraInfo?.hasFlashUnit() == true
+            // Front camera uses screen flash overlay, and Night Sight uses multi-frame no-flash fusion
+            val effectiveFlash = if (
+                uiState.cameraMode == CameraMode.NIGHT ||
+                uiState.lensFacing == CameraSelector.LENS_FACING_FRONT ||
+                boundExtensionMode != null ||
+                !hasHardwareFlash
+            ) {
                 ImageCapture.FLASH_MODE_OFF
             } else {
                 uiState.photoFlashMode
@@ -420,6 +472,7 @@ fun CameraScreen(
     LaunchedEffect(
         cameraControl,
         cameraInfo,
+        boundExtensionMode,
         uiState.cameraMode,
         uiState.proWhiteBalance,
         uiState.proIso,
@@ -430,6 +483,7 @@ fun CameraScreen(
         minFocusDistance
     ) {
         val control = cameraControl ?: return@LaunchedEffect
+        if (boundExtensionMode != null) return@LaunchedEffect
         applyProCaptureRequestOptions(
             control = control,
             info = cameraInfo,
@@ -439,9 +493,13 @@ fun CameraScreen(
     }
 
     // Bind Camera Use Cases
-    val shouldUseNightExtension = uiState.cameraMode == CameraMode.PHOTO &&
-        uiState.isNightModeActive &&
-        isNightExtensionAvailable
+    val shouldRequestNightExtension = when (uiState.cameraMode) {
+        CameraMode.NIGHT -> true
+        CameraMode.PHOTO -> uiState.isAutoNightModeEnabled &&
+            uiState.isNightModeActive &&
+            !viewModel.isFlashOverridingAutoNight(uiState)
+        else -> false
+    }
 
     LaunchedEffect(
         uiState.lensFacing,
@@ -451,7 +509,7 @@ fun CameraScreen(
         uiState.videoQuality,
         uiState.videoFps,
         uiState.isVideoHdrEnabled,
-        shouldUseNightExtension,
+        shouldRequestNightExtension,
         uiState.aspectRatioMode.cameraXAspectRatio
     ) {
         val cameraProvider = context.getCameraProvider()
@@ -461,14 +519,37 @@ fun CameraScreen(
             .requireLensFacing(uiState.lensFacing)
             .build()
 
-        val cameraSelector = if (shouldUseNightExtension) {
+        val resolvedNightExtMode = if (
+            uiState.cameraMode == CameraMode.PHOTO ||
+            uiState.cameraMode == CameraMode.NIGHT
+        ) {
             try {
                 val extensionsManager = context.getExtensionsManager(cameraProvider)
+                extensionsManagerRef = extensionsManager
+                resolveSupportedNightExtensionMode(extensionsManager, baseCameraSelector).also { mode ->
+                    availableNightExtensionMode = mode
+                    isNightExtensionChecked = true
+                }
+            } catch (e: Exception) {
+                Log.w("CameraScreen", "Failed to resolve Night Sight extension during bind", e)
+                null
+            }
+        } else {
+            availableNightExtensionMode
+        }
+
+        var sessionExtensionMode: Int? = null
+        val cameraSelector = if (shouldRequestNightExtension && resolvedNightExtMode != null) {
+            try {
+                val extensionsManager = extensionsManagerRef ?: context.getExtensionsManager(cameraProvider)
                 extensionsManager.getExtensionEnabledCameraSelector(
                     baseCameraSelector,
-                    ExtensionMode.NIGHT
-                )
-            } catch (_: Exception) {
+                    resolvedNightExtMode
+                ).also {
+                    sessionExtensionMode = resolvedNightExtMode
+                }
+            } catch (e: Exception) {
+                Log.e("CameraScreen", "Failed to enable Night Sight extension selector", e)
                 baseCameraSelector
             }
         } else {
@@ -509,6 +590,42 @@ fun CameraScreen(
             .setPreviewStabilizationEnabled(isPreviewStabilizationActive)
             .setDynamicRange(dynamicRange)
 
+        if (uiState.cameraMode == CameraMode.PHOTO) {
+            val sessionUsesExtension = sessionExtensionMode != null
+            var lastSceneLuxUpdateMs = 0L
+            Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastSceneLuxUpdateMs < 200L) return
+                        val currentState = viewModel.uiState.value
+                        if (currentState.isScreenFlashActive) return
+
+                        val sceneLux = CameraViewModel.computeSceneLuxFromCaptureMetadata(
+                            iso = result.get(CaptureResult.SENSOR_SENSITIVITY),
+                            exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                            aperture = result.get(CaptureResult.LENS_APERTURE),
+                            aeCompensationIndex = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
+                                ?: currentState.exposureCompensationIndex,
+                            exposureCompensationStep = currentState.exposureCompensationStep,
+                            aeMode = result.get(CaptureResult.CONTROL_AE_MODE)
+                        )
+                        if (sceneLux != null) {
+                            lastSceneLuxUpdateMs = now
+                            viewModel.updateCameraSceneLux(
+                                sceneLux = sceneLux,
+                                fromExtensionSession = sessionUsesExtension
+                            )
+                        }
+                    }
+                }
+            )
+        }
+
         if (uiState.cameraMode == CameraMode.VIDEO && uiState.videoFps != FpsMode.AUTO) {
             uiState.videoFps.value?.let { fps ->
                 val fpsRange = Range(fps, fps)
@@ -522,42 +639,59 @@ fun CameraScreen(
         }
 
         try {
-            if (uiState.cameraMode == CameraMode.PHOTO || uiState.cameraMode == CameraMode.PRO) {
+            if (
+                uiState.cameraMode == CameraMode.PHOTO ||
+                uiState.cameraMode == CameraMode.NIGHT ||
+                uiState.cameraMode == CameraMode.PRO
+            ) {
                 val localCameraInfo = cameraProvider.getCameraInfo(cameraSelector)
                 val isUltraHdrSupported = ImageCapture.getImageCaptureCapabilities(localCameraInfo)
                     .supportedOutputFormats
                     .contains(ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR)
 
-                val effectiveFlash = if (uiState.lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                // CameraX Extensions and dedicated NIGHT mode use MAXIMIZE_QUALITY (never ZSL)
+                val effectiveCaptureMode = if (
+                    uiState.cameraMode == CameraMode.NIGHT ||
+                    sessionExtensionMode != null
+                ) {
+                    ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
+                } else {
+                    uiState.imageCaptureMode
+                }
+
+                val effectiveFlash = if (
+                    uiState.cameraMode == CameraMode.NIGHT ||
+                    uiState.lensFacing == CameraSelector.LENS_FACING_FRONT ||
+                    sessionExtensionMode != null ||
+                    !localCameraInfo.hasFlashUnit()
+                ) {
                     ImageCapture.FLASH_MODE_OFF
                 } else {
                     uiState.photoFlashMode
                 }
 
-                val builder = ImageCapture.Builder()
-                    .setResolutionSelector(resolutionSelector)
-                    .setCaptureMode(uiState.imageCaptureMode)
-                    .setFlashMode(effectiveFlash)
-
-                // Ultra HDR (JPEG_R) in CameraX 1.4 only supports 2-surface combinations (Preview + ImageCapture)
-                // and cannot be combined with ImageAnalysis (Pro mode histogram) or CameraX Extensions.
                 val shouldEnableUltraHdr = isUltraHdrSupported &&
-                    uiState.cameraMode == CameraMode.PHOTO &&
-                    !shouldUseNightExtension &&
-                    uiState.imageCaptureMode != ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
+                    (uiState.cameraMode == CameraMode.PHOTO || uiState.cameraMode == CameraMode.NIGHT) &&
+                    effectiveCaptureMode != ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
 
-                if (shouldEnableUltraHdr) {
-                    builder.setOutputFormat(ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR)
-                    isUltraHdrActive = true
-                } else {
-                    isUltraHdrActive = false
+                fun buildImageCapture(enableUltraHdr: Boolean): ImageCapture {
+                    return ImageCapture.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .setCaptureMode(effectiveCaptureMode)
+                        .setFlashMode(effectiveFlash)
+                        .apply {
+                            if (enableUltraHdr) {
+                                setOutputFormat(ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR)
+                            }
+                        }
+                        .build()
                 }
 
-                val imageCapture = builder.build()
-                imageCaptureUseCase = imageCapture
-                viewModel.setImageCapture(imageCapture)
+                var ultraHdrConfigured = shouldEnableUltraHdr
+                var imageCapture = buildImageCapture(enableUltraHdr = ultraHdrConfigured)
 
                 val camera = if (uiState.cameraMode == CameraMode.PRO) {
+                    boundExtensionMode = null
                     val imageAnalysis = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
@@ -587,17 +721,62 @@ fun CameraScreen(
                         )
                     }
                 } else {
-                    cameraProvider.bindToLifecycle(
-                        lifecycleOwner,
-                        cameraSelector,
-                        preview,
-                        imageCapture
-                    )
+                    try {
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            cameraSelector,
+                            preview,
+                            imageCapture
+                        ).also {
+                            boundExtensionMode = sessionExtensionMode
+                        }
+                    } catch (extBindError: IllegalArgumentException) {
+                        if (sessionExtensionMode != null && ultraHdrConfigured) {
+                            // Retry Night Sight extension with SDR JPEG if Ultra HDR combination was rejected
+                            cameraProvider.unbindAll()
+                            ultraHdrConfigured = false
+                            imageCapture = buildImageCapture(enableUltraHdr = false)
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                cameraSelector,
+                                preview,
+                                imageCapture
+                            ).also {
+                                boundExtensionMode = sessionExtensionMode
+                            }
+                        } else if (sessionExtensionMode != null) {
+                            Log.w("CameraScreen", "Extension bind failed, falling back to base camera", extBindError)
+                            cameraProvider.unbindAll()
+                            sessionExtensionMode = null
+                            boundExtensionMode = null
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                baseCameraSelector,
+                                preview,
+                                imageCapture
+                            )
+                        } else {
+                            throw extBindError
+                        }
+                    }
                 }
+
+                isUltraHdrActive = ultraHdrConfigured
+                imageCaptureUseCase = imageCapture
+                viewModel.setImageCapture(imageCapture)
 
                 cameraControl = camera.cameraControl
                 cameraInfo = camera.cameraInfo
-                camera.cameraControl.setZoomRatio(uiState.zoomLevel)
+                val zoomBounds = camera.cameraInfo.zoomState.value
+                val clampedZoom = if (zoomBounds != null) {
+                    uiState.zoomLevel.coerceIn(zoomBounds.minZoomRatio, zoomBounds.maxZoomRatio)
+                } else {
+                    uiState.zoomLevel
+                }
+                camera.cameraControl.setZoomRatio(clampedZoom)
+                if (clampedZoom != uiState.zoomLevel) {
+                    viewModel.setZoomLevel(clampedZoom)
+                }
                 camera.cameraControl.setExposureCompensationIndex(uiState.exposureCompensationIndex)
 
                 // Query Exposure & Focus capabilities
@@ -613,14 +792,17 @@ fun CameraScreen(
                 }.getOrDefault(10f)
                 minFocusDistance = detectedMinFocus
 
-                // Re-apply Camera2Interop Pro options after unbindAll/bindToLifecycle
-                applyProCaptureRequestOptions(
-                    control = camera.cameraControl,
-                    info = camera.cameraInfo,
-                    uiState = uiState,
-                    minFocusDistance = detectedMinFocus
-                )
+                // Re-apply Camera2Interop Pro options after unbindAll/bindToLifecycle (skip during Extension sessions)
+                if (sessionExtensionMode == null) {
+                    applyProCaptureRequestOptions(
+                        control = camera.cameraControl,
+                        info = camera.cameraInfo,
+                        uiState = uiState,
+                        minFocusDistance = detectedMinFocus
+                    )
+                }
             } else {
+                boundExtensionMode = null
                 isUltraHdrActive = false
                 val recorder = Recorder.Builder()
                     .setQualitySelector(
@@ -653,7 +835,16 @@ fun CameraScreen(
                 )
                 cameraControl = camera.cameraControl
                 cameraInfo = camera.cameraInfo
-                camera.cameraControl.setZoomRatio(uiState.zoomLevel)
+                val zoomBounds = camera.cameraInfo.zoomState.value
+                val clampedZoom = if (zoomBounds != null) {
+                    uiState.zoomLevel.coerceIn(zoomBounds.minZoomRatio, zoomBounds.maxZoomRatio)
+                } else {
+                    uiState.zoomLevel
+                }
+                camera.cameraControl.setZoomRatio(clampedZoom)
+                if (clampedZoom != uiState.zoomLevel) {
+                    viewModel.setZoomLevel(clampedZoom)
+                }
                 camera.cameraControl.setExposureCompensationIndex(uiState.exposureCompensationIndex)
 
                 val expState = camera.cameraInfo.exposureState
@@ -671,9 +862,18 @@ fun CameraScreen(
                 )
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("CameraScreen", "Failed to bind camera use cases", e)
         }
     }
+
+    val isNightSightActive =
+        (uiState.cameraMode == CameraMode.PHOTO || uiState.cameraMode == CameraMode.NIGHT) &&
+            when (boundExtensionMode) {
+                ExtensionMode.NIGHT -> true
+                ExtensionMode.AUTO -> activeAutoExtensionSubMode == null ||
+                    activeAutoExtensionSubMode == ExtensionMode.NIGHT
+                else -> false
+            }
 
     Column(
         modifier = modifier
@@ -915,6 +1115,11 @@ fun CameraScreen(
                 onSetVideoFps = { viewModel.setVideoFps(it) },
                 onToggleVideoStabilization = { viewModel.toggleVideoStabilization() },
                 onToggleVideoHdr = { viewModel.toggleVideoHdr() },
+                isNightExtensionSupported = if (isNightExtensionChecked) {
+                    availableNightExtensionMode != null
+                } else {
+                    null
+                },
                 modifier = Modifier.align(Alignment.TopCenter)
             )
 
@@ -976,7 +1181,7 @@ fun CameraScreen(
 
             // Night Sight Active Pill
             NightSightActivePill(
-                isVisible = uiState.isNightModeActive && uiState.cameraMode == CameraMode.PHOTO,
+                isVisible = isNightSightActive,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(start = 16.dp, bottom = 16.dp)
@@ -1032,10 +1237,23 @@ fun CameraScreen(
     }
 }
 
+private fun resolveSupportedNightExtensionMode(
+    extensionsManager: ExtensionsManager,
+    baseCameraSelector: CameraSelector
+): Int? {
+    return when {
+        extensionsManager.isExtensionAvailable(baseCameraSelector, ExtensionMode.NIGHT) ->
+            ExtensionMode.NIGHT
+        extensionsManager.isExtensionAvailable(baseCameraSelector, ExtensionMode.AUTO) ->
+            ExtensionMode.AUTO
+        else -> null
+    }
+}
+
 suspend fun Context.getCameraProvider(): ProcessCameraProvider = suspendCoroutine { continuation ->
     val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
     cameraProviderFuture.addListener({
-        continuation.resume(cameraProviderFuture.get())
+        continuation.resumeWith(runCatching { cameraProviderFuture.get() })
     }, ContextCompat.getMainExecutor(this))
 }
 
@@ -1051,12 +1269,7 @@ fun Context.findActivity(): Activity? {
 }
 
 suspend fun Context.getExtensionsManager(cameraProvider: ProcessCameraProvider): ExtensionsManager =
-    suspendCoroutine { continuation ->
-        val extensionsManagerFuture = ExtensionsManager.getInstanceAsync(this, cameraProvider)
-        extensionsManagerFuture.addListener({
-            continuation.resume(extensionsManagerFuture.get())
-        }, ContextCompat.getMainExecutor(this))
-    }
+    ExtensionsManager.getInstance(this, cameraProvider)
 
 @OptIn(ExperimentalCamera2Interop::class)
 private fun applyProCaptureRequestOptions(
@@ -1174,4 +1387,3 @@ private enum class ViewfinderGestureMode {
     EV_DRAG,
     CANCELLED
 }
-

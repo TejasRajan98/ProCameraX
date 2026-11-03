@@ -64,6 +64,7 @@ fun TopBarControls(
     onSetVideoFps: (FpsMode) -> Unit,
     onToggleVideoStabilization: () -> Unit,
     onToggleVideoHdr: () -> Unit,
+    isNightExtensionSupported: Boolean? = null,
     modifier: Modifier = Modifier
 ) {
     val haptic = LocalHapticFeedback.current
@@ -84,26 +85,32 @@ fun TopBarControls(
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Flash / Torch
+            val isFlashDisabledInNightMode = uiState.cameraMode == CameraMode.NIGHT
             IconButton(
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onFlashOrTorchClick()
                 },
+                enabled = !isFlashDisabledInNightMode,
                 modifier = Modifier.rotate(uiRotationDegrees)
             ) {
-                val icon = if (uiState.cameraMode == CameraMode.VIDEO) {
-                    if (uiState.isTorchEnabled) Icons.Default.Highlight else Icons.Default.FlashOff
-                } else {
-                    when (uiState.photoFlashMode) {
-                        ImageCapture.FLASH_MODE_AUTO -> Icons.Default.FlashAuto
-                        ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
-                        else -> Icons.Default.FlashOff
+                val icon = when (uiState.cameraMode) {
+                    CameraMode.VIDEO -> {
+                        if (uiState.isTorchEnabled) Icons.Default.Highlight else Icons.Default.FlashOff
+                    }
+                    CameraMode.NIGHT -> Icons.Default.FlashOff
+                    else -> {
+                        when (uiState.photoFlashMode) {
+                            ImageCapture.FLASH_MODE_AUTO -> Icons.Default.FlashAuto
+                            ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
+                            else -> Icons.Default.FlashOff
+                        }
                     }
                 }
-                val tint = if (uiState.cameraMode == CameraMode.VIDEO) {
-                    if (uiState.isTorchEnabled) Color.Yellow else Color.White
-                } else {
-                    if (uiState.photoFlashMode != ImageCapture.FLASH_MODE_OFF) Color.Yellow else Color.White
+                val tint = when (uiState.cameraMode) {
+                    CameraMode.VIDEO -> if (uiState.isTorchEnabled) Color.Yellow else Color.White
+                    CameraMode.NIGHT -> Color.White.copy(alpha = 0.35f)
+                    else -> if (uiState.photoFlashMode != ImageCapture.FLASH_MODE_OFF) Color.Yellow else Color.White
                 }
                 Icon(
                     imageVector = icon,
@@ -257,8 +264,10 @@ fun TopBarControls(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (uiState.cameraMode == CameraMode.PHOTO) {
+                    val isExtUnsupported = isNightExtensionSupported == false
+                    val pillHighlighted = uiState.isAutoNightModeEnabled && !isExtUnsupported
                     Surface(
-                        color = if (uiState.isAutoNightModeEnabled) {
+                        color = if (pillHighlighted) {
                             Color.Yellow.copy(alpha = 0.22f)
                         } else {
                             Color.DarkGray.copy(alpha = 0.55f)
@@ -274,18 +283,81 @@ fun TopBarControls(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
+                            val contentColor = when {
+                                isExtUnsupported -> Color.White.copy(alpha = 0.45f)
+                                uiState.isAutoNightModeEnabled -> Color.Yellow
+                                else -> Color.White
+                            }
+                            val labelText = when {
+                                isExtUnsupported && uiState.isAutoNightModeEnabled -> "NIGHT N/A"
+                                uiState.isAutoNightModeEnabled -> "AUTO NIGHT ON"
+                                else -> "AUTO NIGHT OFF"
+                            }
                             Icon(
                                 imageVector = Icons.Default.NightsStay,
                                 contentDescription = "Auto Night Mode",
-                                tint = if (uiState.isAutoNightModeEnabled) Color.Yellow else Color.White,
+                                tint = contentColor,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
-                                text = if (uiState.isAutoNightModeEnabled) "AUTO NIGHT ON" else "AUTO NIGHT OFF",
-                                color = if (uiState.isAutoNightModeEnabled) Color.Yellow else Color.White,
+                                text = labelText,
+                                color = contentColor,
                                 style = MaterialTheme.typography.labelSmall
                             )
                         }
+                    }
+                }
+
+                if (isUltraHdrActive) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.6f),
+                        shape = CircleShape
+                    ) {
+                        Text(
+                            text = "ULTRA HDR",
+                            color = Color.Yellow,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            }
+        } else if (uiState.cameraMode == CameraMode.NIGHT) {
+            val isExtUnsupported = isNightExtensionSupported == false
+            Row(
+                modifier = Modifier.padding(top = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    color = if (!isExtUnsupported) {
+                        Color.Yellow.copy(alpha = 0.22f)
+                    } else {
+                        Color.DarkGray.copy(alpha = 0.55f)
+                    },
+                    shape = CircleShape
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val contentColor = if (!isExtUnsupported) {
+                            Color.Yellow
+                        } else {
+                            Color.White.copy(alpha = 0.6f)
+                        }
+                        Icon(
+                            imageVector = Icons.Default.NightsStay,
+                            contentDescription = "Night Sight Mode",
+                            tint = contentColor,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = if (!isExtUnsupported) "NIGHT SIGHT" else "NIGHT EXT N/A",
+                            color = contentColor,
+                            style = MaterialTheme.typography.labelSmall
+                        )
                     }
                 }
 
