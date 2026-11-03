@@ -10,7 +10,7 @@ ProCameraX is a feature-rich, high-performance Android camera application built 
 
 ### 📸 Photo & Night Sight Modes
 - **Dedicated Night Mode (`NIGHT`)**: Dedicated bottom-bar Night Sight mode alongside `PHOTO`, `VIDEO`, and `PRO` that binds platform Camera2 Extensions (`ExtensionMode.NIGHT`) with maximum-quality multi-frame fusion on both rear and front lenses.
-- **Debounced Auto Night Sight (`PHOTO`)**: Computes unbiased camera scene illuminance (`lux`) directly from Camera2 Auto-Exposure metadata (`SENSOR_SENSITIVITY`, `SENSOR_EXPOSURE_TIME`, `LENS_APERTURE`) paired with ambient light sensor fallback and adaptive hysteresis to smoothly activate Night Sight in low-light scenes without ping-ponging.
+- **Debounced Auto Night Sight (`PHOTO`)**: Computes unbiased camera scene illuminance (`lux`) directly from Camera2 Auto-Exposure metadata (`SENSOR_SENSITIVITY`, `CONTROL_POST_RAW_SENSITIVITY_BOOST`, `SENSOR_EXPOSURE_TIME`, `LENS_APERTURE`) paired with dual-sensor ambient light detection and adaptive hysteresis to smoothly activate Night Sight in low-light scenes without ping-ponging.
 - **Hold Still Progress UX**: During Night Sight capture, a glassmorphic circular progress overlay displays real-time multi-frame processing percentage.
 - **Tap-to-Focus + Interactive EV Exposure Slider**: Tap anywhere on the viewfinder to focus and drag vertically on the sun slider to adjust exposure compensation (`EV`) in real time.
 - **Front Camera Screen Flash & Shutter Blink**: Automatically boosts screen brightness with a full-white screen flash for front-facing low-light selfies, plus tactile shutter flash feedback.

@@ -168,6 +168,7 @@ fun CameraScreen(
     var activeAutoExtensionSubMode by remember { mutableStateOf<Int?>(null) }
     var extensionsManagerRef by remember { mutableStateOf<ExtensionsManager?>(null) }
     var isUltraHdrActive by remember { mutableStateOf(false) }
+    val activeBindToken = remember { java.util.concurrent.atomic.AtomicInteger(0) }
 
     DisposableEffect(cameraInfo) {
         val liveData = cameraInfo?.zoomState
@@ -333,8 +334,9 @@ fun CameraScreen(
         }
     }
 
-    LaunchedEffect(desiredNightModeTarget) {
+    LaunchedEffect(desiredNightModeTarget, uiState.isNightModeActive) {
         val target = desiredNightModeTarget ?: return@LaunchedEffect
+        if (uiState.isNightModeActive == target) return@LaunchedEffect
         val debounceMs = if (target) {
             CameraViewModel.AUTO_NIGHT_ENTER_DEBOUNCE_MS
         } else {
@@ -512,6 +514,7 @@ fun CameraScreen(
         shouldRequestNightExtension,
         uiState.aspectRatioMode.cameraXAspectRatio
     ) {
+        val bindToken = activeBindToken.incrementAndGet()
         val cameraProvider = context.getCameraProvider()
         cameraProvider.unbindAll()
 
@@ -600,21 +603,29 @@ fun CameraScreen(
                         request: CaptureRequest,
                         result: TotalCaptureResult
                     ) {
+                        if (activeBindToken.get() != bindToken) return
                         val now = System.currentTimeMillis()
                         if (now - lastSceneLuxUpdateMs < 200L) return
                         val currentState = viewModel.uiState.value
                         if (currentState.isScreenFlashActive) return
 
+                        val postRawBoost = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
+                        } else {
+                            null
+                        }
                         val sceneLux = CameraViewModel.computeSceneLuxFromCaptureMetadata(
                             iso = result.get(CaptureResult.SENSOR_SENSITIVITY),
                             exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
                             aperture = result.get(CaptureResult.LENS_APERTURE),
+                            postRawSensitivityBoost = postRawBoost,
                             aeCompensationIndex = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
                                 ?: currentState.exposureCompensationIndex,
                             exposureCompensationStep = currentState.exposureCompensationStep,
-                            aeMode = result.get(CaptureResult.CONTROL_AE_MODE)
+                            aeMode = result.get(CaptureResult.CONTROL_AE_MODE),
+                            aeState = result.get(CaptureResult.CONTROL_AE_STATE)
                         )
-                        if (sceneLux != null) {
+                        if (sceneLux != null && activeBindToken.get() == bindToken) {
                             lastSceneLuxUpdateMs = now
                             viewModel.updateCameraSceneLux(
                                 sceneLux = sceneLux,

@@ -530,11 +530,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     internal fun isFlashOverridingAutoNight(state: CameraUiState = uiState.value): Boolean {
-        return if (state.lensFacing == CameraSelector.LENS_FACING_FRONT) {
-            state.photoFlashMode != ImageCapture.FLASH_MODE_OFF
-        } else {
-            state.photoFlashMode == ImageCapture.FLASH_MODE_ON
-        }
+        return state.photoFlashMode == ImageCapture.FLASH_MODE_ON
     }
 
     /**
@@ -559,17 +555,23 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         return if (!state.isNightModeActive) {
             val sceneLux = state.cameraSceneLux
-            if (sceneLux != null) {
-                if (sceneLux < SCENE_LUX_ENTER_THRESHOLD) true else null
-            } else {
-                val ambient = state.ambientLux
-                if (ambient != null && ambient < AMBIENT_LUX_ENTER_THRESHOLD) true else null
-            }
+            val ambient = state.ambientLux
+            val isCameraSceneDark = sceneLux != null && sceneLux < SCENE_LUX_ENTER_THRESHOLD
+            val isAmbientDark = ambient != null &&
+                ambient < AMBIENT_LUX_ENTER_THRESHOLD &&
+                (sceneLux == null || sceneLux < AMBIENT_ASSIST_MAX_SCENE_LUX)
+            if (isCameraSceneDark || isAmbientDark) true else null
         } else {
-            if (state.hasExtensionSceneLuxSample && state.cameraSceneLux != null) {
-                if (state.cameraSceneLux > SCENE_LUX_EXIT_THRESHOLD) false else null
+            val sceneLux = state.cameraSceneLux
+            val ambient = state.ambientLux
+            if (state.hasExtensionSceneLuxSample && sceneLux != null) {
+                val requiredExitSceneLux = if (ambient != null && ambient < AMBIENT_LUX_ENTER_THRESHOLD) {
+                    AMBIENT_ASSIST_EXIT_SCENE_LUX
+                } else {
+                    SCENE_LUX_EXIT_THRESHOLD
+                }
+                if (sceneLux > requiredExitSceneLux) false else null
             } else {
-                val ambient = state.ambientLux
                 val baselineAmbient = state.ambientLuxAtNightActivation
                 val adaptiveExitThreshold = if (baselineAmbient != null) {
                     maxOf(AMBIENT_LUX_EXIT_MIN_THRESHOLD, baselineAmbient * 2.2f + 15.0f)
@@ -587,11 +589,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         return when (state.photoFlashMode) {
             ImageCapture.FLASH_MODE_ON -> true
             ImageCapture.FLASH_MODE_AUTO -> {
-                val lux = state.ambientLux
-                if (lux != null) {
-                    lux < FRONT_AUTO_FLASH_LUX_THRESHOLD
-                } else {
+                if (state.cameraMode == CameraMode.PHOTO &&
+                    state.isAutoNightModeEnabled &&
                     state.isNightModeActive
+                ) {
+                    false
+                } else {
+                    val lux = state.ambientLux
+                    if (lux != null) {
+                        lux < FRONT_AUTO_FLASH_LUX_THRESHOLD
+                    } else {
+                        state.isNightModeActive
+                    }
                 }
             }
             else -> false
@@ -818,28 +827,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         internal const val KEY_FRONT_FLASH_MODE = "pref_front_photo_flash_mode"
         internal const val KEY_AUTO_NIGHT_MODE = "pref_auto_night_mode"
         internal const val FRONT_AUTO_FLASH_LUX_THRESHOLD = 20.0f
-        internal const val SCENE_LUX_ENTER_THRESHOLD = 22.0f
-        internal const val SCENE_LUX_EXIT_THRESHOLD = 38.0f
-        internal const val AMBIENT_LUX_ENTER_THRESHOLD = 15.0f
-        internal const val AMBIENT_LUX_EXIT_MIN_THRESHOLD = 35.0f
-        internal const val AUTO_NIGHT_ENTER_DEBOUNCE_MS = 1000L
+        internal const val SCENE_LUX_ENTER_THRESHOLD = 45.0f
+        internal const val SCENE_LUX_EXIT_THRESHOLD = 80.0f
+        internal const val AMBIENT_LUX_ENTER_THRESHOLD = 20.0f
+        internal const val AMBIENT_ASSIST_MAX_SCENE_LUX = 140.0f
+        internal const val AMBIENT_ASSIST_EXIT_SCENE_LUX = 180.0f
+        internal const val AMBIENT_LUX_EXIT_MIN_THRESHOLD = 45.0f
+        internal const val AUTO_NIGHT_ENTER_DEBOUNCE_MS = 750L
         internal const val AUTO_NIGHT_EXIT_DEBOUNCE_MS = 1500L
         private const val DEFAULT_LENS_APERTURE = 1.8
 
         /**
          * Estimates unbiased camera scene illuminance (lux) from Camera2 Auto-Exposure metadata,
-         * removing intentional user exposure compensation bias so manual EV adjustments do not
+         * accounting for post-RAW digital ISP sensitivity boost (used heavily on Pixel Tensor ISPs)
+         * and removing intentional user exposure compensation bias so manual EV adjustments do not
          * falsely trigger or suppress Auto Night Sight.
          */
         internal fun computeSceneLuxFromCaptureMetadata(
             iso: Int?,
             exposureTimeNs: Long?,
             aperture: Float?,
+            postRawSensitivityBoost: Int? = null,
             aeCompensationIndex: Int = 0,
             exposureCompensationStep: Float = 0.33f,
-            aeMode: Int? = null
+            aeMode: Int? = null,
+            aeState: Int? = null
         ): Float? {
             if (aeMode == CameraMetadata.CONTROL_AE_MODE_OFF) return null
+            if (aeState == CameraMetadata.CONTROL_AE_STATE_INACTIVE) return null
             if (iso == null || iso <= 0) return null
             if (exposureTimeNs == null || exposureTimeNs <= 0L) return null
 
@@ -851,7 +866,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             val exposureSeconds = exposureTimeNs.toDouble() / 1_000_000_000.0
             if (exposureSeconds <= 0.0) return null
 
-            val effectiveLux = 2.5 * ((fNumber * fNumber) / exposureSeconds) * (100.0 / iso.toDouble())
+            val boostMultiplier = if (postRawSensitivityBoost != null && postRawSensitivityBoost > 0) {
+                postRawSensitivityBoost.toDouble() / 100.0
+            } else {
+                1.0
+            }
+            val totalIso = iso.toDouble() * boostMultiplier
+            if (totalIso <= 0.0) return null
+
+            val effectiveLux = 2.5 * ((fNumber * fNumber) / exposureSeconds) * (100.0 / totalIso)
             val evBias = aeCompensationIndex.toDouble() * exposureCompensationStep.toDouble()
             val unbiasedLux = effectiveLux * 2.0.pow(evBias)
 

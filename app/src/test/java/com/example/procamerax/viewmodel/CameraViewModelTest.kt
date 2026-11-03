@@ -261,7 +261,7 @@ class CameraViewModelTest {
         assertEquals(zeroEvLux!!, plusTwoEvLux!!, 0.5f)
         assertTrue(plusTwoEvLux > CameraViewModel.SCENE_LUX_ENTER_THRESHOLD)
 
-        // Manual AE_MODE_OFF returns null
+        // Manual AE_MODE_OFF or uninitialized AE_STATE_INACTIVE returns null
         assertNull(
             CameraViewModel.computeSceneLuxFromCaptureMetadata(
                 iso = 3200,
@@ -270,6 +270,25 @@ class CameraViewModelTest {
                 aeMode = CameraMetadata.CONTROL_AE_MODE_OFF
             )
         )
+        assertNull(
+            CameraViewModel.computeSceneLuxFromCaptureMetadata(
+                iso = 100,
+                exposureTimeNs = 33_333_333L,
+                aperture = 1.68f,
+                aeState = CameraMetadata.CONTROL_AE_STATE_INACTIVE
+            )
+        )
+
+        // Pixel Tensor ISP low-light split gain: analog ISO 350 + post-RAW boost 400 (total ISO 1400)
+        // at 1/30s on f/1.68 -> ~15.1 lux (< SCENE_LUX_ENTER_THRESHOLD), whereas ignoring boost would read ~60.5 lux
+        val pixelBoostedNightLux = CameraViewModel.computeSceneLuxFromCaptureMetadata(
+            iso = 350,
+            exposureTimeNs = 33_333_333L,
+            aperture = 1.68f,
+            postRawSensitivityBoost = 400
+        )
+        assertNotNull(pixelBoostedNightLux)
+        assertTrue(pixelBoostedNightLux!! < CameraViewModel.SCENE_LUX_ENTER_THRESHOLD)
     }
 
     @Test
@@ -287,8 +306,8 @@ class CameraViewModelTest {
         // Steady 75 lux ambient sensor must NOT falsely exit Night Mode when extension omits AE keys
         assertNull(viewModel.evaluateAutoNightTarget())
 
-        // If extension session reports bright live scene lux (> 38 lux), Auto Night requests exit
-        viewModel.updateCameraSceneLux(65f, fromExtensionSession = true)
+        // If extension session reports bright live scene lux (> 80 lux), Auto Night requests exit
+        viewModel.updateCameraSceneLux(95f, fromExtensionSession = true)
         assertEquals(false, viewModel.evaluateAutoNightTarget())
 
         // Reset and verify adaptive ambient exit when walking into bright daylight (> 75 * 2.2 + 15 = 180 lux)
@@ -297,6 +316,50 @@ class CameraViewModelTest {
         viewModel.setNightModeActive(true)
         viewModel.updateAmbientLux(220f)
         assertEquals(false, viewModel.evaluateAutoNightTarget())
+    }
+
+    @Test
+    fun `auto night activates in dark ambient rooms even if cameraSceneLux is non-null and avoids ping-pong`() {
+        // Dark room (3 lux on light sensor) while camera AE scene lux reads 95 lux (e.g. lamp/TV in frame or ISP gain)
+        viewModel.updateAmbientLux(3f)
+        viewModel.updateCameraSceneLux(95f, fromExtensionSession = false)
+        assertEquals(true, viewModel.evaluateAutoNightTarget())
+
+        // Once active in a dark room, 95 lux extension scene lux must NOT cause exit ping-pong while ambient is 3 lux
+        viewModel.setNightModeActive(true)
+        viewModel.updateCameraSceneLux(95f, fromExtensionSession = true)
+        assertNull(viewModel.evaluateAutoNightTarget())
+
+        // Covering the bezel sensor (0 lux) in bright daylight (800 scene lux) must NOT falsely trigger Night Sight
+        viewModel.setNightModeActive(false)
+        viewModel.updateAmbientLux(0f)
+        viewModel.updateCameraSceneLux(800f, fromExtensionSession = false)
+        assertNull(viewModel.evaluateAutoNightTarget())
+    }
+
+    @Test
+    fun `front camera FLASH_MODE_AUTO allows auto night and suppresses screen flash while Night Sight is active`() {
+        viewModel.toggleLens()
+        assertEquals(CameraSelector.LENS_FACING_FRONT, viewModel.uiState.value.lensFacing)
+
+        // Cycle front flash OFF -> AUTO
+        viewModel.cyclePhotoFlashMode()
+        assertEquals(ImageCapture.FLASH_MODE_AUTO, viewModel.uiState.value.photoFlashMode)
+
+        // In low light, Auto Night still activates even with front flash set to AUTO
+        viewModel.updateAmbientLux(4f)
+        viewModel.updateCameraSceneLux(12f)
+        assertEquals(true, viewModel.evaluateAutoNightTarget())
+
+        // Once Night Sight is active on front camera with FLASH_MODE_AUTO, white screen flash is suppressed
+        viewModel.setNightModeActive(true)
+        assertFalse(viewModel.shouldTriggerFrontScreenFlash())
+
+        // Explicit FLASH_MODE_ON overrides Auto Night and forces screen flash
+        viewModel.cyclePhotoFlashMode()
+        assertEquals(ImageCapture.FLASH_MODE_ON, viewModel.uiState.value.photoFlashMode)
+        assertFalse(viewModel.uiState.value.isNightModeActive)
+        assertTrue(viewModel.shouldTriggerFrontScreenFlash())
     }
 
     @Test
